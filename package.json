@@ -79,6 +79,12 @@
     "vitest-browser-svelte": "^2.0.2"
   },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lokander/sveltekit-tasks.git"
+  },
+  "homepage": "https://github.com/lokander/sveltekit-tasks#readme",
+  "bugs": "https://github.com/lokander/sveltekit-tasks/issues",
   "keywords": [
     "svelte",
     "sveltekit",
