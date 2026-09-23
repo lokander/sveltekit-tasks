@@ -1,5 +1,6 @@
 import type { RequestEvent } from "@sveltejs/kit";
 import type { TaskContext, TaskSSEMessage, TaskState } from "../shared/types.js";
+import type { PersistenceAdapter } from "./persistence/types.js";
 
 /**
  * A function that performs the actual work of a task. Receives a {@link TaskContext}
@@ -12,6 +13,12 @@ export type TaskHandler = (ctx: TaskContext) => Promise<void>;
 export type TaskRegisterOptions = {
   /** Auto-cancel the task after this many milliseconds. The task transitions to `"timed_out"` status. */
   timeout?: number;
+  /**
+   * When a persisted state shows this task was `"running"` at the time the server stopped,
+   * restart it automatically. When `false`, the task is marked `"error"` instead.
+   * Only relevant with a `persistence` adapter. @default false
+   */
+  restartInterrupted?: boolean;
 };
 
 /** @internal */
@@ -19,6 +26,7 @@ export type RegisteredTask = {
   id: string;
   handler: TaskHandler;
   timeout?: number;
+  restartInterrupted?: boolean;
 };
 
 /** Payload delivered to {@link TaskManager.subscribe} listeners on every state change. */
@@ -53,7 +61,15 @@ export type TaskManagerOptions = {
    * instead of sending a full init dump. `0` (default) disables buffering.
    */
   eventBufferSize?: number;
+  /**
+   * Adapter for persisting task state across server restarts (e.g. {@link sqliteAdapter}).
+   * State is in-memory only when omitted.
+   */
+  persistence?: PersistenceAdapter;
 };
+
+/** Error message assigned to tasks that were running when the server stopped. */
+export const INTERRUPTED_ERROR = "Interrupted by server restart";
 
 const TERMINAL_STATUSES = new Set(["completed", "error", "canceled", "timed_out"]);
 
@@ -61,8 +77,8 @@ const TERMINAL_STATUSES = new Set(["completed", "error", "canceled", "timed_out"
  * In-memory manager for background tasks. Handles registration, execution,
  * cancellation, progress reporting, and pub-sub notifications.
  *
- * State is held in memory and is **not** persisted — a server restart loses all
- * state and running tasks. Only suitable for single-process deployments.
+ * State is held in memory. Pass a `persistence` adapter to restore task state
+ * after a server restart. Only suitable for single-process deployments.
  *
  * @example
  * ```ts
@@ -92,11 +108,23 @@ export class TaskManager {
   private nextEventId = 1;
   private eventBuffer: TaskUpdateEvent[] = [];
   private ringHead = 0;
+  private persistence: PersistenceAdapter | undefined;
+  /** Persisted states loaded from the adapter whose tasks haven't been registered yet. */
+  private persisted = new Map<string, TaskState>();
+  private writeChain: Promise<void> | undefined;
+
+  /**
+   * Resolves once persisted state has been loaded and applied. Resolves immediately
+   * without a `persistence` adapter, or when the adapter loads synchronously.
+   */
+  readonly ready: Promise<void>;
 
   constructor(options: TaskManagerOptions = {}) {
     this.debug = options.debug ?? false;
     this.maxHistory = options.maxHistory ?? 0;
     this.eventBufferSize = options.eventBufferSize ?? 0;
+    this.persistence = options.persistence;
+    this.ready = this.load();
   }
 
   /**
@@ -109,8 +137,19 @@ export class TaskManager {
     if (this.tasks.has(taskId)) {
       throw new Error(`Task "${taskId}" is already registered`);
     }
-    this.tasks.set(taskId, { id: taskId, handler, timeout: options?.timeout });
+    this.tasks.set(taskId, {
+      id: taskId,
+      handler,
+      timeout: options?.timeout,
+      restartInterrupted: options?.restartInterrupted,
+    });
     this.state.set(taskId, { id: taskId, status: "pending" });
+
+    const persisted = this.persisted.get(taskId);
+    if (persisted) {
+      this.persisted.delete(taskId);
+      this.restore(persisted);
+    }
   }
 
   /**
@@ -198,6 +237,14 @@ export class TaskManager {
   /** Get the current state of all registered tasks. */
   getAllStates(): TaskState[] {
     return Array.from(this.state.values());
+  }
+
+  /**
+   * Wait for all pending persistence writes to settle. Call before a graceful
+   * shutdown when using an async `persistence` adapter.
+   */
+  async flush(): Promise<void> {
+    while (this.writeChain) await this.writeChain;
   }
 
   /**
@@ -380,7 +427,92 @@ export class TaskManager {
     }
   }
 
-  private setState(taskId: string, newState: TaskState): void {
+  private load(): Promise<void> {
+    const persistence = this.persistence;
+    if (!persistence) return Promise.resolve();
+
+    const onError = (error: unknown) => {
+      console.error("Failed to load persisted task state:", error);
+    };
+
+    let loaded: TaskState[] | Promise<TaskState[]>;
+    try {
+      loaded = persistence.load();
+    } catch (error) {
+      onError(error);
+      return Promise.resolve();
+    }
+
+    if (loaded instanceof Promise) {
+      return loaded.then((states) => this.hydrate(states), onError);
+    }
+    this.hydrate(loaded);
+    return Promise.resolve();
+  }
+
+  private hydrate(states: TaskState[]): void {
+    for (const state of states) {
+      if (!this.tasks.has(state.id)) {
+        this.persisted.set(state.id, state);
+      } else if (!this.runGeneration.has(state.id)) {
+        // Only restore tasks that haven't been started in this process
+        this.restore(state);
+      }
+    }
+    this.evictOldTasks();
+  }
+
+  private restore(state: TaskState): void {
+    const taskId = state.id;
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+
+    switch (state.status) {
+      case "pending":
+        return;
+      case "running":
+        if (task.restartInterrupted) {
+          this.start(taskId);
+        } else {
+          this.setState(taskId, {
+            id: taskId,
+            status: "error",
+            lastRun: Date.now(),
+            error: INTERRUPTED_ERROR,
+          });
+        }
+        return;
+      default:
+        this.setState(taskId, state, false);
+    }
+  }
+
+  private persist(write: () => void | Promise<void>): void {
+    const onError = (error: unknown) => {
+      console.error("Failed to persist task state:", error);
+    };
+
+    let result: void | Promise<void>;
+    if (this.writeChain) {
+      // Serialize behind in-flight async writes
+      result = this.writeChain.then(write);
+    } else {
+      try {
+        result = write();
+      } catch (error) {
+        onError(error);
+        return;
+      }
+      if (!(result instanceof Promise)) return;
+    }
+
+    const chain: Promise<void> = result.catch(onError).then(() => {
+      if (this.writeChain === chain) this.writeChain = undefined;
+    });
+    this.writeChain = chain;
+  }
+
+  private setState(taskId: string, newState: TaskState, persist = true): void {
     const current = this.state.get(taskId);
     if (!current) return;
 
@@ -393,6 +525,12 @@ export class TaskManager {
       return;
 
     this.state.set(taskId, newState);
+
+    // Only status transitions are persisted — progress updates are transient
+    const persistence = this.persistence;
+    if (persistence && persist && current.status !== newState.status) {
+      this.persist(() => persistence.save(newState));
+    }
 
     const eventId = this.nextEventId++;
     const event: TaskUpdateEvent = { taskId, state: newState, eventId };
@@ -424,9 +562,11 @@ export class TaskManager {
 
     const terminalTasks: Array<{ id: string; lastRun: number }> = [];
 
-    for (const [id, s] of this.state) {
-      if (TERMINAL_STATUSES.has(s.status) && "lastRun" in s) {
-        terminalTasks.push({ id, lastRun: s.lastRun });
+    for (const states of [this.state, this.persisted]) {
+      for (const [id, s] of states) {
+        if (TERMINAL_STATUSES.has(s.status) && "lastRun" in s) {
+          terminalTasks.push({ id, lastRun: s.lastRun });
+        }
       }
     }
 
@@ -441,6 +581,10 @@ export class TaskManager {
       this.abortControllers.delete(id);
       this.runGeneration.delete(id);
       this.timeouts.delete(id);
+      this.persisted.delete(id);
+
+      const persistence = this.persistence;
+      if (persistence) this.persist(() => persistence.delete(id));
     }
   }
 
@@ -467,6 +611,7 @@ export class TaskManager {
     this.tasks.clear();
     this.state.clear();
     this.runGeneration.clear();
+    this.persisted.clear();
     this.eventBuffer = [];
     this.ringHead = 0;
   }

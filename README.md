@@ -2,7 +2,7 @@
 
 Background task runner for SvelteKit with real-time progress streaming via Server-Sent Events (SSE).
 
-> **Heads up:** This is an in-memory, single-process task manager. It's designed as an easy drop-in for small self-hosted projects — not for production systems that need horizontal scaling or persistence. See [Limitations](#limitations) for details.
+> **Heads up:** This is a single-process task manager. State is in-memory by default, with opt-in persistence (SQLite built in). It's designed as an easy drop-in for small self-hosted projects — not for production systems that need horizontal scaling. See [Limitations](#limitations) for details.
 
 ## Features
 
@@ -14,6 +14,7 @@ Background task runner for SvelteKit with real-time progress streaming via Serve
 - Composable `TaskItem` component with snippet-based per-status rendering
 - Authorization support for SSE endpoints
 - Configurable task history retention (`maxHistory`)
+- Opt-in persistence via a pluggable adapter (SQLite built in) so task state survives restarts
 
 ## Install
 
@@ -123,6 +124,43 @@ The `handler` receives a `TaskContext`:
 
 Limits the number of tasks in terminal states (completed, error, canceled, timed_out) kept in memory. When exceeded, the oldest terminal tasks (by `lastRun`) are evicted from all internal maps. Useful for long-running servers with dynamically registered tasks.
 
+#### `persistence`
+
+State is in-memory by default. Pass a `PersistenceAdapter` to restore task state after a server restart. The built-in `sqliteAdapter` has no dependencies and works with any synchronous SQLite driver — `node:sqlite`, `better-sqlite3` or `bun:sqlite`:
+
+```ts
+import { DatabaseSync } from "node:sqlite"; // or: import Database from "better-sqlite3";
+import { TaskManager, sqliteAdapter } from "sveltekit-tasks/server";
+
+const db = new DatabaseSync("tasks.db");
+
+export const tasks = new TaskManager({
+  persistence: sqliteAdapter(db, { tableName: "sveltekit_tasks" }), // tableName is optional
+});
+
+// Restart automatically if the server stopped while this task was running
+tasks.register("nightly-sync", handler, { restartInterrupted: true });
+```
+
+- Only **status transitions** are persisted — progress updates are not.
+- Persisted state is applied when a task is registered. States for ids that are never registered stay in storage (and still count towards `maxHistory`).
+- Tasks that were `"running"` when the server stopped become `"error"` with `error: "Interrupted by server restart"` (exported as `INTERRUPTED_ERROR`), unless registered with `restartInterrupted: true`.
+- `maxHistory` evictions are deleted from storage as well.
+
+Custom adapters implement three methods, each of which may be sync or async:
+
+```ts
+import type { PersistenceAdapter } from "sveltekit-tasks/server";
+
+const adapter: PersistenceAdapter = {
+  load: () => db.getAllTaskStates(), // called once, on construction
+  save: (state) => db.upsertTaskState(state),
+  delete: (taskId) => db.deleteTaskState(taskId),
+};
+```
+
+With an async `load()`, persisted state is applied when it resolves — `await tasks.ready` if you need it first. Async writes are serialized in order; `await tasks.flush()` before a graceful shutdown to make sure they've landed. Write failures are logged and never affect in-memory state.
+
 #### `eventBufferSize`
 
 Enables event buffering for `Last-Event-ID` replay. When a client reconnects, it sends its last received event ID. If the buffer can satisfy the request, only missed events are replayed instead of a full state dump. Set to `0` (default) to disable.
@@ -201,7 +239,7 @@ import type {
 
 ## Limitations
 
-- **In-memory only** — task state is not persisted. A server restart loses all state and running tasks.
+- **In-memory by default** — without a `persistence` adapter, a server restart loses all state. Even with one, running handlers are not resumed mid-run: interrupted tasks are marked as failed or restarted from scratch.
 - **Single-instance** — state is held in a JS `Map`. In multi-process or multi-server deployments, tasks on one instance are not visible to SSE connections on another.
 - **No concurrency control** — all registered tasks can run simultaneously. Implement your own limiter if needed.
 - **No progress throttling** — every `ctx.progress()` call emits an SSE message. If your task reports progress in a tight loop, consider adding your own debounce/throttle to avoid flooding clients.
@@ -210,7 +248,7 @@ import type {
 
 These are not currently planned but could be added in the future:
 
-- **Persistence adapter** — pluggable storage (Redis, database) so task state survives server restarts.
+- **More persistence adapters** — e.g. Postgres, Redis.
 - **Horizontal scaling** — shared state across multiple server instances via an adapter.
 - **Concurrency control** — `maxConcurrent` option to limit how many tasks run simultaneously, with a queue for excess.
 - **Task scheduling / queuing** — delayed execution, priority queues, cron-like scheduling.
