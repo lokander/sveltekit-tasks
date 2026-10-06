@@ -50,7 +50,7 @@
                     </p>
                   {/if}
                   <button
-                    class="btn mt-2 btn-soft btn-sm btn-error"
+                    class="btn mt-2 btn-soft btn-error btn-sm"
                     onclick={() => cancelTask(runningTask.id)}
                   >
                     Cancel
@@ -64,7 +64,7 @@
                     Completed at {new Date(completedTask.lastRun).toLocaleTimeString()}
                   </p>
                   <button
-                    class="btn mt-2 btn-soft btn-sm btn-primary"
+                    class="btn mt-2 btn-soft btn-primary btn-sm"
                     onclick={() => startTask(completedTask.id)}
                   >
                     Start
@@ -76,7 +76,7 @@
                 <div>
                   <p class="text-sm text-error">Error: {errorTask.error}</p>
                   <button
-                    class="btn mt-2 btn-soft btn-sm btn-primary"
+                    class="btn mt-2 btn-soft btn-primary btn-sm"
                     onclick={() => startTask(errorTask.id)}
                   >
                     Retry
@@ -88,7 +88,7 @@
                 <div>
                   <p class="text-sm text-warning">Canceled</p>
                   <button
-                    class="btn mt-2 btn-soft btn-sm btn-primary"
+                    class="btn mt-2 btn-soft btn-primary btn-sm"
                     onclick={() => startTask(canceledTask.id)}
                   >
                     Start
@@ -100,7 +100,7 @@
                 <div>
                   <p class="text-sm text-base-content/50">Never run</p>
                   <button
-                    class="btn mt-2 btn-soft btn-sm btn-primary"
+                    class="btn mt-2 btn-soft btn-primary btn-sm"
                     onclick={() => startTask(pendingTask.id)}
                   >
                     Start

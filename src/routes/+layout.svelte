@@ -15,10 +15,10 @@
 <div class="flex min-h-screen flex-col">
   <div class="navbar bg-base-100">
     <div class="navbar-start">
-      <a href={resolve("/")} class="btn text-xl btn-ghost">sveltekit-tasks</a>
+      <a href={resolve("/")} class="btn btn-ghost text-xl">sveltekit-tasks</a>
     </div>
     <div class="navbar-center">
-      <nav class="tabs-border tabs flex gap-1">
+      <nav class="tabs tabs-border flex gap-1">
         <a href={resolve("/")} class="tab" class:tab-active={page.url.pathname === "/"}> Docs </a>
         <a href={resolve("/demo")} class="tab" class:tab-active={page.url.pathname === "/demo"}>
           Demo
@@ -30,7 +30,7 @@
         <input type="checkbox" bind:checked={light} />
         <!-- sun icon -->
         <svg
-          class="swap-on h-5 w-5 fill-current"
+          class="h-5 w-5 swap-on fill-current"
           xmlns="http://www.w3.org/2000/svg"
           viewBox="0 0 24 24"
         >
@@ -40,7 +40,7 @@
         </svg>
         <!-- moon icon -->
         <svg
-          class="swap-off h-5 w-5 fill-current"
+          class="h-5 w-5 swap-off fill-current"
           xmlns="http://www.w3.org/2000/svg"
           viewBox="0 0 24 24"
         >
