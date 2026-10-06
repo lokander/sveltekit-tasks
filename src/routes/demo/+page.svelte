@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { TaskEventSource } from "$lib/client/use-task-events.svelte.js";
-  import TaskItem from "$lib/client/TaskItem.svelte";
+  import { TaskEventSource } from "#lib/client/use-task-events.svelte.js";
+  import TaskItem from "#lib/client/TaskItem.svelte";
   import { startTask, cancelTask } from "./tasks.remote.js";
 
   const taskNames: Record<string, string> = {

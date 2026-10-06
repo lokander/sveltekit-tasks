@@ -28,7 +28,7 @@ bun run test:unit -- --project client             # Only client (browser) tests
 
 ## Tech Stack
 
-- **SvelteKit 2** with **Svelte 5** (runes mode) — library project via `@sveltejs/package`
+- **SvelteKit 3** with **Svelte 5** (runes mode) — library project via `@sveltejs/package`
 - **Bun** as package manager
 - **Tailwind CSS 4** (Vite plugin integration)
 - **MDsveX** for Markdown in Svelte components (`.svx` files)
@@ -44,11 +44,11 @@ This is a **SvelteKit library project** — `src/lib/` contains the publishable 
 
 ## Svelte 5 Configuration
 
-Experimental features enabled in `svelte.config.js`:
+SvelteKit 3 no longer reads `svelte.config.js` — all Svelte/Kit options are passed to the `sveltekit()` plugin in `vite.config.ts`. Experimental features enabled there:
 
 - `compilerOptions.runes: true` — Svelte 5 runes mode
 - `compilerOptions.experimental.async: true` — `await` directly in components
-- `kit.experimental.remoteFunctions: true` — remote functions (`query`/`command` from `$app/server`)
+- `experimental.remoteFunctions: true` — remote functions (`query`/`command` from `$app/server`)
 
 Core runes:
 
@@ -74,7 +74,7 @@ Usage in components:
 
 ### Server/Client Boundary
 
-`$lib/server/` is a server-only boundary enforced by SvelteKit — client-reachable modules cannot import runtime values from it. Types can cross via `import type`. Place shared constants/types in `$lib/`.
+`src/lib/server/` is a server-only boundary enforced by SvelteKit — client-reachable modules cannot import runtime values from it. Types can cross via `import type`. Place shared constants/types in `src/lib/`. The demo app imports library code via the `#lib` subpath import (declared in `package.json` `imports`; SvelteKit 3 replaced `$lib`).
 
 ## Testing
 
@@ -105,6 +105,8 @@ Prettier enforced (`bun run format` / `bun run lint`):
 ## Design Decisions
 
 - **SSE format**: data-only messages (`data: {...}\n\n`) with a `type` discriminator in the JSON payload. No `event:` field — avoids redundant dispatching across protocol and application layers.
+- **`@sveltejs/kit` peer range is `^2.0.0 || ^3.0.0`**: the published code only imports the `RequestEvent` type from Kit, which both majors provide (Kit 3 just makes its fields `readonly`, and we only read them). Development and CI run on Kit 3. README examples keep `$lib/...` imports because they are still valid on Kit 2; Kit 3 users write `#lib/...`.
+- **TypeScript is capped at 6**: Kit 3 and `@sveltejs/package` 3 require TS 6, while `svelte-check` and `typescript-eslint` don't support TS 7 yet. Revisit when their peer ranges allow it.
 - **Package exports**: the `"svelte"` condition is only needed on exports containing Svelte components or `.svelte.ts` rune files. Type-only exports (root `.`) and pure TS server code (`./server`) use `"default"` only.
 - **Task run generation counter**: `TaskManager` tracks a `runGeneration` per task to prevent stale runs from clobbering state. When a task is canceled and restarted, the old `runTask` promise may still settle — the generation check ensures only the current run can update state, report progress, or clean up the abort controller.
 - **`TaskEventSource` class**: uses a class (not a function) so consumers get reactive properties via `taskEvents.tasks` and `taskEvents.connected` without needing a `$derived` wrapper. This is the idiomatic Svelte 5 pattern (matches Runed, official tutorials).

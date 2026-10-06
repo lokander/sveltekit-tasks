@@ -62,14 +62,14 @@ function latestMock(): MockEventSource {
 
 describe("TaskEventSource", () => {
   it("connects and sets connected to true", async () => {
-    const screen = render(UseTaskEventsTest, { url: "/test/sse" });
+    const screen = await render(UseTaskEventsTest, { url: "/test/sse" });
     await expect.element(screen.getByTestId("connected")).toHaveTextContent("true");
   });
 
   it('reports "connecting" on first load, distinct from "reconnecting" after a drop', async () => {
     vi.useFakeTimers();
     MockEventSource.autoOpen = false;
-    const screen = render(UseTaskEventsTest, {
+    const screen = await render(UseTaskEventsTest, {
       url: "/test/sse",
       options: { reconnectDelay: 100 },
     });
@@ -95,7 +95,7 @@ describe("TaskEventSource", () => {
   });
 
   it("populates tasks from init messages", async () => {
-    const screen = render(UseTaskEventsTest, { url: "/test/sse" });
+    const screen = await render(UseTaskEventsTest, { url: "/test/sse" });
     // Wait for connection
     await expect.element(screen.getByTestId("connected")).toHaveTextContent("true");
 
@@ -113,7 +113,7 @@ describe("TaskEventSource", () => {
   });
 
   it("updates tasks from update messages", async () => {
-    const screen = render(UseTaskEventsTest, { url: "/test/sse" });
+    const screen = await render(UseTaskEventsTest, { url: "/test/sse" });
     await expect.element(screen.getByTestId("connected")).toHaveTextContent("true");
 
     const mock = latestMock();
@@ -132,7 +132,7 @@ describe("TaskEventSource", () => {
   });
 
   it("removes tasks from removed messages", async () => {
-    const screen = render(UseTaskEventsTest, { url: "/test/sse" });
+    const screen = await render(UseTaskEventsTest, { url: "/test/sse" });
     await expect.element(screen.getByTestId("connected")).toHaveTextContent("true");
 
     const mock = latestMock();
@@ -148,7 +148,7 @@ describe("TaskEventSource", () => {
 
   it("ignores invalid JSON messages", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const screen = render(UseTaskEventsTest, { url: "/test/sse" });
+    const screen = await render(UseTaskEventsTest, { url: "/test/sse" });
     await expect.element(screen.getByTestId("connected")).toHaveTextContent("true");
 
     const mock = latestMock();
@@ -164,7 +164,7 @@ describe("TaskEventSource", () => {
 
   it("sets connected to false on error", async () => {
     const onError = vi.fn();
-    const screen = render(UseTaskEventsTest, {
+    const screen = await render(UseTaskEventsTest, {
       url: "/test/sse",
       options: { onError, maxRetries: 0 },
     });
@@ -181,7 +181,7 @@ describe("TaskEventSource", () => {
 
   it("includes lastEventId in reconnect URL", async () => {
     vi.useFakeTimers();
-    render(UseTaskEventsTest, {
+    await render(UseTaskEventsTest, {
       url: "/test/sse",
       options: { reconnectDelay: 100, maxRetries: 3 },
     });
@@ -212,7 +212,7 @@ describe("TaskEventSource", () => {
 
   it("URL-encodes the lastEventId", async () => {
     vi.useFakeTimers();
-    render(UseTaskEventsTest, { url: "/test/sse", options: { reconnectDelay: 100 } });
+    await render(UseTaskEventsTest, { url: "/test/sse", options: { reconnectDelay: 100 } });
     await vi.advanceTimersByTimeAsync(0);
 
     const mock1 = latestMock();
@@ -229,7 +229,7 @@ describe("TaskEventSource", () => {
 
   it("stops reconnecting after maxRetries and reports exhausted", async () => {
     vi.useFakeTimers();
-    const screen = render(UseTaskEventsTest, {
+    const screen = await render(UseTaskEventsTest, {
       url: "/test/sse",
       options: { reconnectDelay: 100, maxReconnectDelay: 100, maxRetries: 2 },
     });
@@ -267,7 +267,7 @@ describe("TaskEventSource", () => {
 
   it("close() closes the EventSource and stops reconnecting; reconnect() reopens", async () => {
     vi.useFakeTimers();
-    const screen = render(UseTaskEventsTest, {
+    const screen = await render(UseTaskEventsTest, {
       url: "/test/sse",
       options: { reconnectDelay: 100 },
     });
@@ -300,7 +300,7 @@ describe("TaskEventSource", () => {
 
   it("closes the EventSource and cancels a pending reconnect on unmount", async () => {
     vi.useFakeTimers();
-    const screen = render(UseTaskEventsTest, {
+    const screen = await render(UseTaskEventsTest, {
       url: "/test/sse",
       options: { reconnectDelay: 100 },
     });

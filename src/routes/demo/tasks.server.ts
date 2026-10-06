@@ -1,4 +1,4 @@
-import { TaskManager } from "$lib/server/manager.js";
+import { TaskManager } from "#lib/server/manager.js";
 
 export const tasks = new TaskManager();
 

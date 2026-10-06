@@ -32,26 +32,26 @@ function makeTask(
 describe("TaskItem", () => {
   describe("pending status", () => {
     it("renders default pending UI", async () => {
-      const screen = render(TaskItem, { task: makeTask() });
+      const screen = await render(TaskItem, { task: makeTask() });
       await expect.element(screen.getByText("test-task: pending")).toBeVisible();
     });
 
     it("shows Start button when onstart is provided", async () => {
       const onstart = vi.fn();
-      const screen = render(TaskItem, { task: makeTask(), onstart });
+      const screen = await render(TaskItem, { task: makeTask(), onstart });
       await screen.getByRole("button", { name: "Start" }).click();
       expect(onstart).toHaveBeenCalledWith("test-task");
     });
 
     it("hides Start button when onstart is not provided", async () => {
-      const screen = render(TaskItem, { task: makeTask() });
+      const screen = await render(TaskItem, { task: makeTask() });
       await expect.element(screen.getByRole("button", { name: "Start" })).not.toBeInTheDocument();
     });
   });
 
   describe("running status", () => {
     it("renders default running UI without progress", async () => {
-      const screen = render(TaskItem, { task: makeTask("running") });
+      const screen = await render(TaskItem, { task: makeTask("running") });
       await expect.element(screen.getByText("test-task: running")).toBeVisible();
     });
 
@@ -59,7 +59,7 @@ describe("TaskItem", () => {
       const task = makeTask("running", {
         progress: { message: "Processing items...", current: 5, total: 10 },
       });
-      const screen = render(TaskItem, { task });
+      const screen = await render(TaskItem, { task });
       await expect
         .element(screen.getByText("test-task: running — Processing items..."))
         .toBeVisible();
@@ -67,7 +67,7 @@ describe("TaskItem", () => {
 
     it("shows Cancel button when oncancel is provided", async () => {
       const oncancel = vi.fn();
-      const screen = render(TaskItem, {
+      const screen = await render(TaskItem, {
         task: makeTask("running"),
         oncancel,
       });
@@ -76,20 +76,20 @@ describe("TaskItem", () => {
     });
 
     it("hides Cancel button when oncancel is not provided", async () => {
-      const screen = render(TaskItem, { task: makeTask("running") });
+      const screen = await render(TaskItem, { task: makeTask("running") });
       await expect.element(screen.getByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
     });
   });
 
   describe("completed status", () => {
     it("renders default completed UI", async () => {
-      const screen = render(TaskItem, { task: makeTask("completed") });
+      const screen = await render(TaskItem, { task: makeTask("completed") });
       await expect.element(screen.getByText("test-task: completed")).toBeVisible();
     });
 
     it("shows Start button for re-run", async () => {
       const onstart = vi.fn();
-      const screen = render(TaskItem, {
+      const screen = await render(TaskItem, {
         task: makeTask("completed"),
         onstart,
       });
@@ -101,13 +101,13 @@ describe("TaskItem", () => {
   describe("error status", () => {
     it("renders error message", async () => {
       const task = makeTask("error", { error: "Connection refused" });
-      const screen = render(TaskItem, { task });
+      const screen = await render(TaskItem, { task });
       await expect.element(screen.getByText("test-task: error — Connection refused")).toBeVisible();
     });
 
     it("shows Retry button when onstart is provided", async () => {
       const onstart = vi.fn();
-      const screen = render(TaskItem, {
+      const screen = await render(TaskItem, {
         task: makeTask("error", { error: "boom" }),
         onstart,
       });
@@ -118,13 +118,13 @@ describe("TaskItem", () => {
 
   describe("canceled status", () => {
     it("renders default canceled UI", async () => {
-      const screen = render(TaskItem, { task: makeTask("canceled") });
+      const screen = await render(TaskItem, { task: makeTask("canceled") });
       await expect.element(screen.getByText("test-task: canceled")).toBeVisible();
     });
 
     it("shows Start button for restart", async () => {
       const onstart = vi.fn();
-      const screen = render(TaskItem, {
+      const screen = await render(TaskItem, {
         task: makeTask("canceled"),
         onstart,
       });
@@ -135,13 +135,13 @@ describe("TaskItem", () => {
 
   describe("timed_out status", () => {
     it("renders default timed out UI", async () => {
-      const screen = render(TaskItem, { task: makeTask("timed_out") });
+      const screen = await render(TaskItem, { task: makeTask("timed_out") });
       await expect.element(screen.getByText("test-task: timed out")).toBeVisible();
     });
 
     it("shows Retry button when onstart is provided", async () => {
       const onstart = vi.fn();
-      const screen = render(TaskItem, {
+      const screen = await render(TaskItem, {
         task: makeTask("timed_out"),
         onstart,
       });
@@ -150,7 +150,7 @@ describe("TaskItem", () => {
     });
 
     it("hides Retry button when onstart is not provided", async () => {
-      const screen = render(TaskItem, { task: makeTask("timed_out") });
+      const screen = await render(TaskItem, { task: makeTask("timed_out") });
       await expect.element(screen.getByRole("button", { name: "Retry" })).not.toBeInTheDocument();
     });
   });
