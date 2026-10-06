@@ -302,9 +302,10 @@ export class TaskManager {
    * Create a SvelteKit `GET` request handler that streams task state via Server-Sent Events.
    *
    * On connection the handler sends a `: connected` comment (so response headers are
-   * flushed immediately), then an `"init"` message for every registered task,
-   * then streams `"update"` and `"removed"` messages as tasks change. A heartbeat
-   * comment (`: heartbeat`) is sent periodically to keep the connection alive.
+   * flushed immediately), then an `"init"` message for every registered task and a
+   * closing `"synced"` message, then streams `"update"` and `"removed"` messages as tasks
+   * change. A heartbeat comment (`: heartbeat`) is sent periodically to keep the connection
+   * alive.
    *
    * When the client reconnects with a `Last-Event-ID` header (per the SSE spec)
    * or a `lastEventId` query parameter (used by the built-in client hook) and
@@ -373,6 +374,8 @@ export class TaskManager {
             for (const task of this.getAllStates()) {
               controller.enqueue(encode(currentEventId, { type: "init", task }));
             }
+            // Tells the client the snapshot is complete, so it can drop tasks that weren't in it
+            controller.enqueue(encode(currentEventId, { type: "synced" }));
           }
 
           // Subscribe to live updates

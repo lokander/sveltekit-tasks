@@ -145,6 +145,29 @@ describe("createSSEHandler", () => {
     });
   });
 
+  // Lets the client drop tasks it knew about that the dump no longer contains
+  it("ends the init dump with a synced message", async () => {
+    const tm = new TaskManager();
+    tm.register("a", async () => {});
+    tm.register("b", async () => {});
+
+    const response = await tm.createSSEHandler()(makeEvent());
+    const blocks = await readBlocks(response, 3);
+
+    expect(blocks.map((b) => b.msg.type)).toEqual(["init", "init", "synced"]);
+    expect(blocks[2].id).toBe(blocks[1].id);
+  });
+
+  it("sends a synced message with an event id when there are no tasks", async () => {
+    const tm = new TaskManager();
+
+    const response = await tm.createSSEHandler()(makeEvent());
+    const [block] = await readBlocks(response, 1);
+
+    expect(block.msg).toEqual({ type: "synced" });
+    expect(block.id).toMatch(/^[a-z0-9]+:\d+$/);
+  });
+
   it("streams update messages when tasks change", async () => {
     const tm = new TaskManager();
     tm.register("test", async (ctx) => {
@@ -155,7 +178,7 @@ describe("createSSEHandler", () => {
     const response = await handler(makeEvent());
 
     // Read the init message first
-    const initMessages = await readMessages(response, 1);
+    const initMessages = await readMessages(response, 2); // init + synced
     expect(initMessages[0].type).toBe("init");
 
     // Start the task — should produce update messages
@@ -175,7 +198,7 @@ describe("createSSEHandler", () => {
     tm.register("a", async () => {});
 
     const response = await tm.createSSEHandler()(makeEvent());
-    await readMessages(response, 1);
+    await readMessages(response, 2); // init + synced
 
     tm.register("b", async () => {});
 
@@ -189,7 +212,7 @@ describe("createSSEHandler", () => {
     tm.register("job-2", async () => {}, { ephemeral: true });
 
     const response = await tm.createSSEHandler()(makeEvent());
-    await readMessages(response, 2);
+    await readMessages(response, 3); // 2 init + synced
 
     tm.start("job-1");
     await tick();
@@ -278,6 +301,19 @@ describe("createSSEHandler", () => {
       const response2 = await handler(makeEventWithParam({ lastEventId }));
       const replayed = await readMessages(response2, 1);
       expect(replayed[0].type).toBe("update");
+    });
+
+    // A replay is a delta, not a snapshot — a synced message would wipe the client's tasks
+    it("does not send a synced message after a replay", async () => {
+      const tm = new TaskManager({ eventBufferSize: 10 });
+      tm.register("a", async () => {});
+      const lastEventId = await connectAndGetLastEventId(tm, 1);
+
+      const response = await tm.createSSEHandler()(makeEventWithParam({ lastEventId }));
+      const reader = response.body!.getReader();
+
+      expect(await readOrTimeout(reader)).toMatch(/^: /);
+      expect(await readOrTimeout(reader)).toBe("timeout");
     });
 
     it("replays exactly the missed events, in order, after the ring buffer has wrapped", async () => {
@@ -416,6 +452,7 @@ describe("createSSEHandler", () => {
       const reader = response.body!.getReader();
       await reader.read(); // connected comment
       await reader.read(); // init
+      await reader.read(); // synced
 
       tm[Symbol.dispose]();
 

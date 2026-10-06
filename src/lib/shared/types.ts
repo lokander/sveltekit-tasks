@@ -75,8 +75,11 @@ export type TaskContext = {
  * - `"update"` — sent whenever a task's state changes after the initial snapshot,
  *   including when a new task is registered (its `"pending"` state).
  * - `"removed"` — sent when a task is unregistered (e.g. evicted by `maxHistory`).
+ * - `"synced"` — ends a full init dump (never a replay). Tasks the client holds that were not
+ *   in the dump no longer exist on the server and should be dropped.
  */
 export type TaskSSEMessage =
   | { type: "init"; task: TaskState }
   | { type: "update"; taskId: string; state: TaskState }
-  | { type: "removed"; taskId: string };
+  | { type: "removed"; taskId: string }
+  | { type: "synced" };

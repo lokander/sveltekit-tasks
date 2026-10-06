@@ -146,6 +146,62 @@ describe("TaskEventSource", () => {
     await expect.element(screen.getByTestId("task-a")).not.toBeInTheDocument();
   });
 
+  describe("init dump on reconnect", () => {
+    const init = (mock: MockEventSource, id: string, status = "pending") =>
+      mock.simulateMessage(JSON.stringify({ type: "init", task: { id, status } }), "e:1");
+    const synced = (mock: MockEventSource) =>
+      mock.simulateMessage(JSON.stringify({ type: "synced" }), "e:1");
+
+    /** Render, deliver a dump of `ids`, then drop the connection and wait for the retry. */
+    async function connectThenDrop(ids: string[]) {
+      const screen = await render(UseTaskEventsTest, {
+        url: "/test/sse",
+        options: { reconnectDelay: 10 },
+      });
+      await expect.element(screen.getByTestId("connected")).toHaveTextContent("true");
+      const first = latestMock();
+      for (const id of ids) init(first, id);
+      synced(first);
+      await expect.element(screen.getByTestId("task-count")).toHaveTextContent(`${ids.length}`);
+
+      first.simulateError();
+      await expect.poll(() => latestMock()).not.toBe(first);
+      await expect.element(screen.getByTestId("connected")).toHaveTextContent("true");
+      return { screen, second: latestMock() };
+    }
+
+    // e.g. an ephemeral task evicted, or a server restart, while the client was offline
+    it("drops tasks that are missing from a fresh dump", async () => {
+      const { screen, second } = await connectThenDrop(["a", "b"]);
+
+      init(second, "b", "completed");
+      synced(second);
+
+      await expect.element(screen.getByTestId("task-a")).not.toBeInTheDocument();
+      await expect.element(screen.getByTestId("task-b")).toHaveTextContent("b:completed");
+    });
+
+    it("clears all tasks when the dump is empty", async () => {
+      const { screen, second } = await connectThenDrop(["a", "b"]);
+
+      synced(second);
+
+      await expect.element(screen.getByTestId("task-count")).toHaveTextContent("0");
+    });
+
+    it("keeps tasks when the server replays instead of dumping", async () => {
+      const { screen, second } = await connectThenDrop(["a", "b"]);
+
+      second.simulateMessage(
+        JSON.stringify({ type: "update", taskId: "b", state: { id: "b", status: "running" } }),
+        "e:2",
+      );
+
+      await expect.element(screen.getByTestId("task-b")).toHaveTextContent("b:running");
+      await expect.element(screen.getByTestId("task-a")).toHaveTextContent("a:pending");
+    });
+  });
+
   it("ignores invalid JSON messages", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const screen = await render(UseTaskEventsTest, { url: "/test/sse" });

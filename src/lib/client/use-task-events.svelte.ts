@@ -97,6 +97,10 @@ export class TaskEventSource {
           ? `${url}${url.includes("?") ? "&" : "?"}lastEventId=${encodeURIComponent(this.#lastEventId)}`
           : url;
       const eventSource = new EventSource(connectUrl);
+      // Ids received in this connection's init dump — anything else is gone once "synced" arrives.
+      // Only read in `onmessage`, never rendered, so it doesn't need to be reactive.
+      // eslint-disable-next-line svelte/prefer-svelte-reactivity
+      const dumped = new Set<string>();
 
       eventSource.onmessage = (event: MessageEvent) => {
         if (event.lastEventId) {
@@ -112,6 +116,11 @@ export class TaskEventSource {
         }
         if (msg.type === "init" && msg.task?.id) {
           this.tasks.set(msg.task.id, msg.task);
+          dumped.add(msg.task.id);
+        } else if (msg.type === "synced") {
+          for (const id of this.tasks.keys()) {
+            if (!dumped.has(id)) this.tasks.delete(id);
+          }
         } else if (msg.type === "update" && msg.taskId && msg.state) {
           this.tasks.set(msg.taskId, msg.state);
         } else if (msg.type === "removed" && msg.taskId) {
