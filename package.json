@@ -1,6 +1,6 @@
 {
   "name": "sveltekit-tasks",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Background task manager for SvelteKit with SSE-based progress streaming",
   "scripts": {
     "dev": "vite dev",
