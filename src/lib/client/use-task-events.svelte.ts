@@ -1,5 +1,17 @@
+import { untrack } from "svelte";
 import { SvelteMap } from "svelte/reactivity";
 import type { TaskSSEMessage, TaskState } from "../shared/types.js";
+
+/**
+ * Connection status of a {@link TaskEventSource}.
+ *
+ * - `"connecting"` — first attempt (fresh page load) or right after {@link TaskEventSource.reconnect}.
+ * - `"open"` — the SSE connection is live.
+ * - `"reconnecting"` — the connection dropped; a retry is scheduled or in flight.
+ * - `"exhausted"` — `maxRetries` consecutive attempts failed; call `reconnect()` to try again.
+ * - `"closed"` — `close()` was called.
+ */
+export type TaskEventSourceStatus = "connecting" | "open" | "reconnecting" | "exhausted" | "closed";
 
 /** Options for {@link TaskEventSource}. */
 export type TaskEventSourceOptions = {
@@ -39,29 +51,50 @@ export type TaskEventSourceOptions = {
 export class TaskEventSource {
   /** Reactive map of task id to current {@link TaskState}. Updated in real-time from SSE messages. */
   readonly tasks = new SvelteMap<string, TaskState>();
-  #connected = $state(false);
+  #status = $state<TaskEventSourceStatus>("connecting");
   #attempts = 0;
   #reconnectTrigger = $state(0);
+  #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   // Non-reactive — tracks the last SSE event ID for replay on reconnect
   #lastEventId = "";
 
-  /** `true` while the SSE connection is open. */
+  /**
+   * Reactive connection status — the single source of truth for the connection UI.
+   * `"connecting"` is the state on a fresh page load (and after {@link reconnect}),
+   * distinct from `"reconnecting"` after a dropped connection.
+   */
+  get status(): TaskEventSourceStatus {
+    return this.#status;
+  }
+
+  /** `true` while the SSE connection is open. Shorthand for `status === "open"`. */
   get connected(): boolean {
-    return this.#connected;
+    return this.#status === "open";
+  }
+
+  /** `true` once `maxRetries` consecutive reconnect attempts have failed. Shorthand for `status === "exhausted"`. */
+  get exhausted(): boolean {
+    return this.#status === "exhausted";
+  }
+
+  /** `true` after {@link close} has been called, until {@link reconnect}. Shorthand for `status === "closed"`. */
+  get closed(): boolean {
+    return this.#status === "closed";
   }
 
   constructor(url: string, options: TaskEventSourceOptions = {}) {
     const { reconnectDelay = 1000, maxReconnectDelay = 30_000, maxRetries = 10, onError } = options;
 
     $effect(() => {
-      // Track reconnectTrigger to re-run on scheduled reconnect
+      // Track reconnectTrigger to re-run on scheduled reconnect. Status is read untracked —
+      // every status change would otherwise tear down and reopen the connection.
       void this.#reconnectTrigger;
 
-      if (this.#attempts > maxRetries) return;
+      if (untrack(() => this.#status) === "closed") return;
 
       const connectUrl =
         this.#lastEventId !== ""
-          ? `${url}${url.includes("?") ? "&" : "?"}lastEventId=${this.#lastEventId}`
+          ? `${url}${url.includes("?") ? "&" : "?"}lastEventId=${encodeURIComponent(this.#lastEventId)}`
           : url;
       const eventSource = new EventSource(connectUrl);
 
@@ -81,32 +114,57 @@ export class TaskEventSource {
           this.tasks.set(msg.task.id, msg.task);
         } else if (msg.type === "update" && msg.taskId && msg.state) {
           this.tasks.set(msg.taskId, msg.state);
+        } else if (msg.type === "removed" && msg.taskId) {
+          this.tasks.delete(msg.taskId);
         }
       };
 
       eventSource.onerror = (event) => {
-        this.#connected = false;
         onError?.(event);
         eventSource.close();
 
         if (this.#attempts < maxRetries) {
+          this.#status = "reconnecting";
           const delay = Math.min(reconnectDelay * 2 ** this.#attempts, maxReconnectDelay);
-          setTimeout(() => {
+          this.#reconnectTimer = setTimeout(() => {
+            this.#reconnectTimer = undefined;
             this.#attempts++;
             this.#reconnectTrigger++;
           }, delay);
+        } else {
+          this.#status = "exhausted";
         }
       };
 
       eventSource.onopen = () => {
-        this.#connected = true;
+        this.#status = "open";
         this.#attempts = 0;
       };
 
       return () => {
-        this.#connected = false;
+        clearTimeout(this.#reconnectTimer);
+        this.#reconnectTimer = undefined;
         eventSource.close();
       };
     });
+  }
+
+  /**
+   * Close the connection and stop reconnecting. The task map is kept as-is.
+   * Call {@link reconnect} to open a new connection.
+   */
+  close(): void {
+    this.#status = "closed";
+    this.#reconnectTrigger++;
+  }
+
+  /**
+   * (Re)open the connection immediately, resetting the retry counter. Use this
+   * after {@link close}, or once {@link exhausted} is `true`.
+   */
+  reconnect(): void {
+    this.#attempts = 0;
+    this.#status = "connecting";
+    this.#reconnectTrigger++;
   }
 }

@@ -17,8 +17,12 @@
   <h1 class="mb-2 text-2xl font-bold">Demo</h1>
   <p class="mb-6 text-sm text-base-content/60">Real-time task management with SSE streaming.</p>
 
-  {#if !taskEvents.connected}
+  {#if taskEvents.status === "connecting"}
     <p class="text-base-content/40">Connecting to task manager...</p>
+  {:else if taskEvents.status === "reconnecting"}
+    <p class="text-warning">Connection lost, reconnecting...</p>
+  {:else if taskEvents.status === "exhausted"}
+    <button class="btn btn-sm btn-warning" onclick={() => taskEvents.reconnect()}>Reconnect</button>
   {:else}
     <div class="flex flex-col gap-3">
       {#each taskList as task (task.id)}
