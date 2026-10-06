@@ -80,7 +80,7 @@ describe("TaskManager persistence", () => {
     const tm = new TaskManager({ persistence: adapter });
     tm.register("a", async () => {});
     const events: string[] = [];
-    tm.subscribe((e) => events.push(e.state.status));
+    tm.subscribe((e) => e.type === "update" && events.push(e.state.status));
 
     expect(tm.getState("a")?.status).toBe("pending");
     await tm.ready;

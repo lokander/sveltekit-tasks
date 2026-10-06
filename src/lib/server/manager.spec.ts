@@ -1,5 +1,23 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { TaskManager } from "./manager.js";
+import type { TaskEvent } from "./manager.js";
+
+/** Advance fake timers (and flush microtasks) by `ms`. Used by tests to move time forward. */
+const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
+
+/** Wait `ms` on the (faked) clock. Used inside task handlers to simulate work. */
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Collect the statuses carried by update events (ignores "removed" events). */
+const statusOf = (event: TaskEvent) => (event.type === "update" ? event.state.status : undefined);
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("TaskManager", () => {
   it("registers a task with pending status", () => {
@@ -27,7 +45,7 @@ describe("TaskManager", () => {
 
   it("starts a task and transitions to running", async () => {
     const handler = vi.fn(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await sleep(50);
     });
     const tm = new TaskManager();
     tm.register("test", handler);
@@ -40,7 +58,7 @@ describe("TaskManager", () => {
     expect(handler).toHaveBeenCalledOnce();
 
     // Wait for completion
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await tick(100);
     const completed = tm.getState("test");
     expect(completed?.status).toBe("completed");
     expect(completed?.status === "completed" && completed.lastRun).toBeTypeOf("number");
@@ -48,7 +66,7 @@ describe("TaskManager", () => {
 
   it("does not start an already running task", async () => {
     const handler = vi.fn(async (): Promise<void> => {
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await sleep(200);
     });
     const tm = new TaskManager({ debug: true });
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -73,14 +91,14 @@ describe("TaskManager", () => {
     });
 
     tm.subscribe((event) => {
-      if (event.state.status === "running" && event.state.progress) {
+      if (event.type === "update" && event.state.status === "running" && event.state.progress) {
         updates.push(event.state.progress.message);
       }
     });
 
     tm.start("test");
     // Wait for the sync handler to complete
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tick(50);
 
     expect(updates).toContain("Step 1");
     expect(updates).toContain("Step 2");
@@ -92,7 +110,7 @@ describe("TaskManager", () => {
     const tm = new TaskManager();
 
     tm.register("test", async (ctx) => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await sleep(50);
       wasCanceled = ctx.isCanceled();
     });
 
@@ -103,7 +121,7 @@ describe("TaskManager", () => {
     expect(state?.status).toBe("canceled");
 
     // Wait for handler to check cancellation
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await tick(100);
     expect(wasCanceled).toBe(true);
   });
 
@@ -115,13 +133,13 @@ describe("TaskManager", () => {
       ctx.signal.addEventListener("abort", () => {
         signalAborted = true;
       });
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await sleep(200);
     });
 
     tm.start("test");
     tm.cancel("test");
 
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tick(50);
     expect(signalAborted).toBe(true);
   });
 
@@ -134,7 +152,7 @@ describe("TaskManager", () => {
 
     tm.start("test");
     // Wait for the async handler to complete and error to be caught
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tick(50);
 
     const state = tm.getState("test");
     expect(state?.status).toBe("error");
@@ -143,30 +161,46 @@ describe("TaskManager", () => {
     errorSpy.mockRestore();
   });
 
+  it("notifies subscribers when a task is registered", () => {
+    const tm = new TaskManager();
+    const callback = vi.fn();
+    tm.subscribe(callback);
+
+    tm.register("test", async () => {});
+
+    expect(callback).toHaveBeenCalledOnce();
+    expect(callback.mock.calls[0][0]).toMatchObject({
+      type: "update",
+      taskId: "test",
+      state: { id: "test", status: "pending" },
+    });
+  });
+
   it("subscribe returns an unsubscribe function", () => {
     const tm = new TaskManager();
     const callback = vi.fn();
 
     const unsub = tm.subscribe(callback);
     tm.register("test", async () => {});
+    expect(callback).toHaveBeenCalledOnce();
 
     unsub();
+    tm.start("test");
 
     // After unsubscribing, callback should not be called for new events
-    // (register doesn't notify, but start does)
-    expect(callback).not.toHaveBeenCalled();
+    expect(callback).toHaveBeenCalledOnce();
   });
 
   it("notifies subscribers on state changes", async () => {
-    const events: Array<{ taskId: string; status: string }> = [];
+    const events: Array<{ taskId: string; status: string | undefined }> = [];
     const tm = new TaskManager();
 
     tm.register("test", async () => {});
-    tm.subscribe((event) => events.push({ taskId: event.taskId, status: event.state.status }));
+    tm.subscribe((event) => events.push({ taskId: event.taskId, status: statusOf(event) }));
 
     tm.start("test");
     // Wait for completion
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tick(50);
 
     expect(events.length).toBeGreaterThanOrEqual(2);
     expect(events[0].status).toBe("running");
@@ -193,13 +227,13 @@ describe("TaskManager", () => {
 
     tm.register("test", async (ctx) => {
       ctx.progress("Before cancel", 1, 2);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await sleep(50);
       // This progress call should be ignored after cancel
       ctx.progress("After cancel", 2, 2);
     });
 
     tm.subscribe((event) => {
-      if (event.state.status === "running" && event.state.progress) {
+      if (event.type === "update" && event.state.status === "running" && event.state.progress) {
         progressMessages.push(event.state.progress.message);
       }
     });
@@ -208,7 +242,7 @@ describe("TaskManager", () => {
     tm.cancel("test");
 
     // Wait for handler to finish
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await tick(100);
 
     expect(progressMessages).toContain("Before cancel");
     expect(progressMessages).not.toContain("After cancel");
@@ -219,7 +253,7 @@ describe("TaskManager", () => {
     const tm = new TaskManager();
 
     tm.register("test", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await sleep(50);
       throw new Error("should be ignored");
     });
 
@@ -227,7 +261,7 @@ describe("TaskManager", () => {
     tm.cancel("test");
 
     // Wait for handler to throw
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await tick(100);
 
     const state = tm.getState("test");
     expect(state?.status).toBe("canceled");
@@ -238,7 +272,7 @@ describe("TaskManager", () => {
     const tm = new TaskManager();
 
     tm.register("test", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await sleep(50);
     });
 
     tm.start("test");
@@ -250,7 +284,7 @@ describe("TaskManager", () => {
     expect(tm.getState("test")?.status).toBe("running");
 
     // Wait for completion
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await tick(100);
     expect(tm.getState("test")?.status).toBe("completed");
   });
 
@@ -306,12 +340,12 @@ describe("TaskManager", () => {
     tm.start("test");
 
     // Second run completes instantly
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tick(50);
     expect(tm.getState("test")?.status).toBe("completed");
 
     // Now let the first run finish — its finally block should NOT delete the abort controller
     firstRunResolve!();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tick(50);
 
     // State should still be "completed" from the second run, not overwritten
     expect(tm.getState("test")?.status).toBe("completed");
@@ -327,29 +361,69 @@ describe("TaskManager", () => {
 
       // Complete tasks in order: a, b, c
       tm.start("a");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await tick(50);
       expect(tm.getState("a")?.status).toBe("completed");
 
       tm.start("b");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await tick(50);
       expect(tm.getState("b")?.status).toBe("completed");
 
       tm.start("c");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await tick(50);
       expect(tm.getState("c")?.status).toBe("completed");
 
-      // "a" should have been evicted (oldest), b and c remain
-      expect(tm.getState("a")).toBeUndefined();
+      // "a" (oldest) loses its result and is reset to pending; b and c keep theirs
+      expect(tm.getState("a")).toEqual({ id: "a", status: "pending" });
       expect(tm.getState("b")?.status).toBe("completed");
       expect(tm.getState("c")?.status).toBe("completed");
-      expect(tm.getAllStates()).toHaveLength(2);
+      expect(tm.getAllStates()).toHaveLength(3);
+    });
+
+    it("keeps the handler of an evicted task so it can run again", async () => {
+      const tm = new TaskManager({ maxHistory: 1 });
+      const events: Array<{ type: string; taskId: string }> = [];
+      tm.register("a", async () => {});
+      tm.register("b", async () => {});
+      tm.subscribe((e) => events.push({ type: e.type, taskId: e.taskId }));
+
+      tm.start("a");
+      await tick(50);
+      tm.start("b");
+      await tick(50);
+      expect(tm.getState("a")?.status).toBe("pending");
+      expect(events).not.toContainEqual({ type: "removed", taskId: "a" });
+
+      tm.start("a");
+      await tick(50);
+      expect(tm.getState("a")?.status).toBe("completed");
+      expect(tm.getState("b")?.status).toBe("pending");
+    });
+
+    it("removes ephemeral tasks entirely and emits a removed event", async () => {
+      const tm = new TaskManager({ maxHistory: 1 });
+      const events: TaskEvent[] = [];
+      tm.register("job-1", async () => {}, { ephemeral: true });
+      tm.register("job-2", async () => {}, { ephemeral: true });
+      tm.subscribe((e) => events.push(e));
+
+      tm.start("job-1");
+      await tick(50);
+      tm.start("job-2");
+      await tick(50);
+
+      expect(tm.getState("job-1")).toBeUndefined();
+      expect(tm.getAllStates().map((s) => s.id)).toEqual(["job-2"]);
+      expect(events).toContainEqual(expect.objectContaining({ type: "removed", taskId: "job-1" }));
+
+      // The id is free to be registered again
+      expect(() => tm.register("job-1", async () => {}, { ephemeral: true })).not.toThrow();
     });
 
     it("does not evict running or pending tasks", async () => {
       const tm = new TaskManager({ maxHistory: 1 });
 
       tm.register("running-task", async () => {
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await sleep(500);
       });
       tm.register("pending-task", async () => {});
       tm.register("a", async () => {});
@@ -358,16 +432,16 @@ describe("TaskManager", () => {
       tm.start("running-task"); // stays running
 
       tm.start("a");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await tick(50);
 
       tm.start("b");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await tick(50);
 
       // "a" should be evicted, "b" remains as the 1 allowed terminal task
       // running-task and pending-task should NOT be evicted
       expect(tm.getState("running-task")?.status).toBe("running");
       expect(tm.getState("pending-task")?.status).toBe("pending");
-      expect(tm.getState("a")).toBeUndefined();
+      expect(tm.getState("a")?.status).toBe("pending");
       expect(tm.getState("b")?.status).toBe("completed");
     });
 
@@ -379,7 +453,7 @@ describe("TaskManager", () => {
         tm.start(`task-${i}`);
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await tick(50);
       expect(tm.getAllStates()).toHaveLength(10);
     });
   });
@@ -391,7 +465,7 @@ describe("TaskManager", () => {
       tm.register(
         "slow",
         async () => {
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          await sleep(500);
         },
         { timeout: 50 },
       );
@@ -399,7 +473,7 @@ describe("TaskManager", () => {
       tm.start("slow");
       expect(tm.getState("slow")?.status).toBe("running");
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tick(100);
 
       const state = tm.getState("slow");
       expect(state?.status).toBe("timed_out");
@@ -416,13 +490,13 @@ describe("TaskManager", () => {
           ctx.signal.addEventListener("abort", () => {
             signalAborted = true;
           });
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          await sleep(500);
         },
         { timeout: 50 },
       );
 
       tm.start("slow");
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tick(100);
 
       expect(signalAborted).toBe(true);
     });
@@ -433,12 +507,12 @@ describe("TaskManager", () => {
       tm.register("fast", async () => {}, { timeout: 500 });
 
       tm.start("fast");
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await tick(50);
 
       expect(tm.getState("fast")?.status).toBe("completed");
 
       // Wait past the timeout — should NOT transition to timed_out
-      await new Promise((resolve) => setTimeout(resolve, 600));
+      await tick(600);
       expect(tm.getState("fast")?.status).toBe("completed");
     });
 
@@ -448,7 +522,7 @@ describe("TaskManager", () => {
       tm.register(
         "test",
         async () => {
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          await sleep(500);
         },
         { timeout: 200 },
       );
@@ -458,7 +532,7 @@ describe("TaskManager", () => {
       expect(tm.getState("test")?.status).toBe("canceled");
 
       // Wait past the timeout — should stay canceled, not timed_out
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await tick(300);
       expect(tm.getState("test")?.status).toBe("canceled");
     });
 
@@ -469,14 +543,14 @@ describe("TaskManager", () => {
       tm.register(
         "test",
         async () => {
-          await new Promise((resolve) => setTimeout(resolve, 100));
+          await sleep(100);
           throw new Error("should be ignored after timeout");
         },
         { timeout: 30 },
       );
 
       tm.start("test");
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await tick(200);
 
       expect(tm.getState("test")?.status).toBe("timed_out");
       errorSpy.mockRestore();
@@ -523,23 +597,23 @@ describe("TaskManager", () => {
     });
 
     tm.subscribe((event) => {
-      if (event.state.status === "running" && event.state.progress) {
+      if (event.type === "update" && event.state.status === "running" && event.state.progress) {
         progressMessages.push(event.state.progress.message);
       }
     });
 
     // Start first run
     tm.start("test");
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await tick(10);
 
     // Cancel and restart (second run)
     tm.cancel("test");
     tm.start("test");
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await tick(10);
 
     // Let first run continue — its progress() should be ignored
     firstRunContinue!();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tick(50);
 
     expect(progressMessages).toContain("Run 1 before");
     expect(progressMessages).toContain("Run 2");
@@ -555,7 +629,7 @@ describe("TaskManager", () => {
         ctx.signal.addEventListener("abort", () => {
           signalAborted = true;
         });
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await sleep(500);
       });
 
       tm.start("test");
@@ -586,7 +660,7 @@ describe("TaskManager", () => {
       tm.register(
         "test",
         async () => {
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          await sleep(500);
         },
         { timeout: 50 },
       );
@@ -595,7 +669,7 @@ describe("TaskManager", () => {
       tm[Symbol.dispose]();
 
       // Wait past the timeout — should not throw or transition
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await tick(100);
       expect(tm.getState("test")).toBeUndefined();
     });
   });

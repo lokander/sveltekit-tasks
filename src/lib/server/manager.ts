@@ -19,6 +19,12 @@ export type TaskRegisterOptions = {
    * Only relevant with a `persistence` adapter. @default false
    */
   restartInterrupted?: boolean;
+  /**
+   * Mark the task as short-lived. When evicted by `maxHistory`, an ephemeral task is
+   * unregistered entirely (handler included) instead of being reset to `"pending"`.
+   * Use this for dynamically created per-job tasks that should not accumulate. @default false
+   */
+  ephemeral?: boolean;
 };
 
 /** @internal */
@@ -27,15 +33,28 @@ export type RegisteredTask = {
   handler: TaskHandler;
   timeout?: number;
   restartInterrupted?: boolean;
+  ephemeral?: boolean;
 };
 
-/** Payload delivered to {@link TaskManager.subscribe} listeners on every state change. */
+/** Delivered to {@link TaskManager.subscribe} listeners when a task's state changes (including registration). */
 export type TaskUpdateEvent = {
+  type: "update";
   taskId: string;
   state: TaskState;
   /** Monotonically increasing event identifier. Used for SSE replay via `Last-Event-ID`. */
   eventId: number;
 };
+
+/** Delivered to {@link TaskManager.subscribe} listeners when a task is unregistered (e.g. `maxHistory` eviction). */
+export type TaskRemovedEvent = {
+  type: "removed";
+  taskId: string;
+  /** Monotonically increasing event identifier. Used for SSE replay via `Last-Event-ID`. */
+  eventId: number;
+};
+
+/** Union of all events delivered to {@link TaskManager.subscribe} listeners. */
+export type TaskEvent = TaskUpdateEvent | TaskRemovedEvent;
 
 /** Options for {@link TaskManager.createSSEHandler}. */
 export type TaskSSEHandlerOptions = {
@@ -50,8 +69,10 @@ export type TaskManagerOptions = {
   /** When `true`, logs warnings to the console for no-op calls (e.g. starting an unregistered or already-running task). */
   debug?: boolean;
   /**
-   * Maximum number of tasks in terminal states (completed, error, canceled, timed_out) to keep.
-   * When exceeded, the oldest terminal tasks (by `lastRun`) are evicted from all internal maps.
+   * Maximum number of tasks in terminal states (completed, error, canceled, timed_out) whose
+   * result is kept. When exceeded, the oldest terminal tasks (by `lastRun`) are evicted:
+   * registered tasks are reset to `"pending"`, tasks registered with `ephemeral: true` and
+   * persisted states for unregistered ids are removed entirely.
    * `undefined` or `0` disables eviction.
    */
   maxHistory?: number;
@@ -72,6 +93,12 @@ export type TaskManagerOptions = {
 export const INTERRUPTED_ERROR = "Interrupted by server restart";
 
 const TERMINAL_STATUSES = new Set(["completed", "error", "canceled", "timed_out"]);
+
+function toSSEMessage(event: TaskEvent): TaskSSEMessage {
+  return event.type === "removed"
+    ? { type: "removed", taskId: event.taskId }
+    : { type: "update", taskId: event.taskId, state: event.state };
+}
 
 /**
  * In-memory manager for background tasks. Handles registration, execution,
@@ -98,15 +125,23 @@ const TERMINAL_STATUSES = new Set(["completed", "error", "canceled", "timed_out"
 export class TaskManager {
   private tasks = new Map<string, RegisteredTask>();
   private state = new Map<string, TaskState>();
-  private subscribers = new Set<(event: TaskUpdateEvent) => void>();
+  private subscribers = new Set<(event: TaskEvent) => void>();
   private abortControllers = new Map<string, AbortController>();
   private runGeneration = new Map<string, number>();
   private timeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Cleanup functions for open SSE streams, so `dispose()` can close them. */
+  private streams = new Set<() => void>();
   private debug: boolean;
   private maxHistory: number;
   private eventBufferSize: number;
   private nextEventId = 1;
-  private eventBuffer: TaskUpdateEvent[] = [];
+  /**
+   * Random per-instance tag prefixed onto SSE event ids (`<epoch>:<eventId>`). Event ids
+   * restart at 1 in every process, so without it a client reconnecting after a server
+   * restart could be served a replay from the wrong incarnation and never receive an init dump.
+   */
+  private readonly epoch = Math.random().toString(36).slice(2, 10);
+  private eventBuffer: TaskEvent[] = [];
   private ringHead = 0;
   private persistence: PersistenceAdapter | undefined;
   /** Persisted states loaded from the adapter whose tasks haven't been registered yet. */
@@ -128,7 +163,8 @@ export class TaskManager {
   }
 
   /**
-   * Register a task with a unique id and a handler function. Initializes the task in `"pending"` status.
+   * Register a task with a unique id and a handler function. Initializes the task in `"pending"`
+   * status and notifies subscribers (and connected SSE clients) of the new task.
    *
    * @throws {Error} If a task with the same id is already registered.
    * @param options - Optional per-task configuration (e.g. `timeout`).
@@ -142,8 +178,11 @@ export class TaskManager {
       handler,
       timeout: options?.timeout,
       restartInterrupted: options?.restartInterrupted,
+      ephemeral: options?.ephemeral,
     });
-    this.state.set(taskId, { id: taskId, status: "pending" });
+    const pending: TaskState = { id: taskId, status: "pending" };
+    this.state.set(taskId, pending);
+    this.emit({ type: "update", taskId, state: pending });
 
     const persisted = this.persisted.get(taskId);
     if (persisted) {
@@ -248,12 +287,13 @@ export class TaskManager {
   }
 
   /**
-   * Subscribe to task state changes. The callback fires on every state update
-   * (status transitions, progress reports, etc.).
+   * Subscribe to task events. The callback fires on every state update (registration,
+   * status transitions, progress reports) and when a task is removed. Narrow on
+   * `event.type` to access `event.state`.
    *
    * @returns An unsubscribe function.
    */
-  subscribe(callback: (event: TaskUpdateEvent) => void): () => void {
+  subscribe(callback: (event: TaskEvent) => void): () => void {
     this.subscribers.add(callback);
     return () => this.subscribers.delete(callback);
   }
@@ -262,13 +302,17 @@ export class TaskManager {
    * Create a SvelteKit `GET` request handler that streams task state via Server-Sent Events.
    *
    * On connection the handler sends an `"init"` message for every registered task,
-   * then streams `"update"` messages as task state changes. A heartbeat comment
-   * (`: heartbeat`) is sent periodically to keep the connection alive.
+   * then streams `"update"` and `"removed"` messages as tasks change. A heartbeat
+   * comment (`: heartbeat`) is sent periodically to keep the connection alive.
    *
    * When the client reconnects with a `Last-Event-ID` header (per the SSE spec)
    * or a `lastEventId` query parameter (used by the built-in client hook) and
    * buffering is enabled (`eventBufferSize > 0`), missed events are replayed
-   * instead of sending a full init dump.
+   * instead of sending a full init dump. Event ids are tagged with a per-process
+   * epoch, so a reconnect after a server restart always falls back to the init dump.
+   *
+   * Note that handler error messages are streamed verbatim to every connected
+   * client — use `authorize` if they may contain sensitive details.
    *
    * @example
    * ```ts
@@ -291,32 +335,27 @@ export class TaskManager {
         }
       }
 
-      const lastEventIdRaw =
-        event.request.headers.get("Last-Event-ID") ?? event.url.searchParams.get("lastEventId");
-      const lastEventId = lastEventIdRaw ? Number(lastEventIdRaw) : undefined;
+      const lastEventId = this.parseLastEventId(
+        event.request.headers.get("Last-Event-ID") ?? event.url.searchParams.get("lastEventId"),
+      );
 
       const encoder = new TextEncoder();
-      let unsubscribe: (() => void) | undefined;
-      let heartbeat: ReturnType<typeof setInterval> | undefined;
+      const encode = (eventId: number, msg: TaskSSEMessage) =>
+        encoder.encode(`id: ${this.epoch}:${eventId}\ndata: ${JSON.stringify(msg)}\n\n`);
+
+      let cleanup: (() => void) | undefined;
 
       const stream = new ReadableStream({
         start: (controller) => {
           let replayed = false;
 
           // Attempt replay from buffer if client provided a lastEventId
-          if (lastEventId !== undefined && !Number.isNaN(lastEventId)) {
+          if (lastEventId !== undefined) {
             const buffered = this.getEventsSince(lastEventId);
             if (buffered !== undefined) {
               replayed = true;
               for (const evt of buffered) {
-                const msg: TaskSSEMessage = {
-                  type: "update",
-                  taskId: evt.taskId,
-                  state: evt.state,
-                };
-                controller.enqueue(
-                  encoder.encode(`id: ${evt.eventId}\ndata: ${JSON.stringify(msg)}\n\n`),
-                );
+                controller.enqueue(encode(evt.eventId, toSSEMessage(evt)));
               }
             }
           }
@@ -325,43 +364,43 @@ export class TaskManager {
           if (!replayed) {
             const currentEventId = this.getCurrentEventId();
             for (const task of this.getAllStates()) {
-              const msg: TaskSSEMessage = { type: "init", task };
-              controller.enqueue(
-                encoder.encode(`id: ${currentEventId}\ndata: ${JSON.stringify(msg)}\n\n`),
-              );
+              controller.enqueue(encode(currentEventId, { type: "init", task }));
             }
           }
 
           // Subscribe to live updates
-          unsubscribe = this.subscribe((evt) => {
+          const unsubscribe = this.subscribe((evt) => {
             try {
-              const msg: TaskSSEMessage = {
-                type: "update",
-                taskId: evt.taskId,
-                state: evt.state,
-              };
-              controller.enqueue(
-                encoder.encode(`id: ${evt.eventId}\ndata: ${JSON.stringify(msg)}\n\n`),
-              );
+              controller.enqueue(encode(evt.eventId, toSSEMessage(evt)));
             } catch {
-              clearInterval(heartbeat);
-              unsubscribe?.();
+              cleanup?.();
             }
           });
 
           // Heartbeat to keep connection alive
-          heartbeat = setInterval(() => {
+          const heartbeat = setInterval(() => {
             try {
               controller.enqueue(encoder.encode(`: heartbeat\n\n`));
             } catch {
-              clearInterval(heartbeat);
-              unsubscribe?.();
+              cleanup?.();
             }
           }, heartbeatInterval);
+
+          const close = () => {
+            clearInterval(heartbeat);
+            unsubscribe();
+            this.streams.delete(close);
+            try {
+              controller.close();
+            } catch {
+              // Already closed or canceled by the client
+            }
+          };
+          cleanup = close;
+          this.streams.add(close);
         },
-        cancel() {
-          clearInterval(heartbeat);
-          unsubscribe?.();
+        cancel: () => {
+          cleanup?.();
         },
       });
 
@@ -369,6 +408,8 @@ export class TaskManager {
         headers: {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
+          // Disable response buffering in nginx so events reach the client immediately
+          "X-Accel-Buffering": "no",
         },
       });
     };
@@ -378,8 +419,22 @@ export class TaskManager {
     return this.nextEventId - 1;
   }
 
-  private getEventsSince(lastEventId: number): TaskUpdateEvent[] | undefined {
+  /**
+   * Parse a `Last-Event-ID` value of the form `<epoch>:<eventId>`. Returns `undefined`
+   * when the value is missing, malformed, or from a different manager instance — all of
+   * which must fall back to a full init dump.
+   */
+  private parseLastEventId(raw: string | null): number | undefined {
+    if (!raw) return undefined;
+    const sep = raw.indexOf(":");
+    if (sep === -1 || raw.slice(0, sep) !== this.epoch) return undefined;
+    const id = Number(raw.slice(sep + 1));
+    return Number.isInteger(id) && id >= 0 ? id : undefined;
+  }
+
+  private getEventsSince(lastEventId: number): TaskEvent[] | undefined {
     if (this.eventBufferSize === 0) return undefined;
+    if (lastEventId > this.getCurrentEventId()) return undefined; // from the future — unknown client
     if (this.eventBuffer.length === 0) return [];
 
     const len = this.eventBuffer.length;
@@ -387,7 +442,7 @@ export class TaskManager {
     const oldest = this.eventBuffer[oldestIdx];
     if (lastEventId < oldest.eventId - 1) return undefined; // gap — can't serve
 
-    const result: TaskUpdateEvent[] = [];
+    const result: TaskEvent[] = [];
     for (let i = 0; i < len; i++) {
       const event = this.eventBuffer[(oldestIdx + i) % len];
       if (event.eventId > lastEventId) {
@@ -532,28 +587,32 @@ export class TaskManager {
       this.persist(() => persistence.save(newState));
     }
 
-    const eventId = this.nextEventId++;
-    const event: TaskUpdateEvent = { taskId, state: newState, eventId };
+    this.emit({ type: "update", taskId, state: newState });
+
+    if (TERMINAL_STATUSES.has(newState.status)) {
+      this.evictOldTasks();
+    }
+  }
+
+  /** Assign an event id, buffer the event for replay, and notify subscribers. */
+  private emit(event: Omit<TaskUpdateEvent, "eventId"> | Omit<TaskRemovedEvent, "eventId">): void {
+    const full = { ...event, eventId: this.nextEventId++ } as TaskEvent;
 
     if (this.eventBufferSize > 0) {
       if (this.eventBuffer.length < this.eventBufferSize) {
-        this.eventBuffer.push(event);
+        this.eventBuffer.push(full);
       } else {
-        this.eventBuffer[this.ringHead] = event;
+        this.eventBuffer[this.ringHead] = full;
         this.ringHead = (this.ringHead + 1) % this.eventBufferSize;
       }
     }
 
     for (const callback of this.subscribers) {
       try {
-        callback(event);
+        callback(full);
       } catch (error) {
         console.error("Error in task subscriber:", error);
       }
-    }
-
-    if (TERMINAL_STATUSES.has(newState.status)) {
-      this.evictOldTasks();
     }
   }
 
@@ -576,12 +635,22 @@ export class TaskManager {
     const toEvict = terminalTasks.slice(0, terminalTasks.length - this.maxHistory);
 
     for (const { id } of toEvict) {
-      this.tasks.delete(id);
-      this.state.delete(id);
-      this.abortControllers.delete(id);
-      this.runGeneration.delete(id);
-      this.timeouts.delete(id);
-      this.persisted.delete(id);
+      const task = this.tasks.get(id);
+      if (task && !task.ephemeral) {
+        // Registered, non-ephemeral task: drop the result but keep the handler
+        const pending: TaskState = { id, status: "pending" };
+        this.state.set(id, pending);
+        this.emit({ type: "update", taskId: id, state: pending });
+      } else {
+        const wasVisible = this.state.has(id);
+        this.tasks.delete(id);
+        this.state.delete(id);
+        this.abortControllers.delete(id);
+        this.runGeneration.delete(id);
+        this.timeouts.delete(id);
+        this.persisted.delete(id);
+        if (wasVisible) this.emit({ type: "removed", taskId: id });
+      }
 
       const persistence = this.persistence;
       if (persistence) this.persist(() => persistence.delete(id));
@@ -590,13 +659,18 @@ export class TaskManager {
 
   /**
    * Dispose of the task manager, releasing all resources. Aborts all running
-   * tasks, clears all timeouts, and removes all subscribers. No events are
-   * emitted during disposal.
+   * tasks, clears all timeouts, closes open SSE streams, and removes all
+   * subscribers. No events are emitted during disposal.
    *
    * Can be used with the `using` keyword: `using tasks = new TaskManager();`
    */
   [Symbol.dispose](): void {
     this.subscribers.clear();
+
+    for (const cleanup of [...this.streams]) {
+      cleanup();
+    }
+    this.streams.clear();
 
     for (const controller of this.abortControllers.values()) {
       controller.abort();

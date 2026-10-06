@@ -33,31 +33,39 @@ function makeEventWithHeader(headers: Record<string, string>): RequestEvent {
   } as unknown as RequestEvent;
 }
 
-async function readMessages(response: Response, count: number): Promise<TaskSSEMessage[]> {
+type Block = { id: string | undefined; msg: TaskSSEMessage };
+
+/** Read `count` SSE blocks (ignoring comments) and return their id + parsed payload. */
+async function readBlocks(response: Response, count: number): Promise<Block[]> {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
-  const messages: TaskSSEMessage[] = [];
+  const blocks: Block[] = [];
   let buffer = "";
 
-  while (messages.length < count) {
+  while (blocks.length < count) {
     const { value, done } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
 
-    const blocks = buffer.split("\n\n");
-    buffer = blocks.pop() ?? "";
+    const raw = buffer.split("\n\n");
+    buffer = raw.pop() ?? "";
 
-    for (const block of blocks) {
-      // Parse SSE blocks: extract the data line from "data: ..."
-      const dataLine = block.split("\n").find((line) => line.startsWith("data: "));
+    for (const block of raw) {
+      const lines = block.split("\n");
+      const dataLine = lines.find((line) => line.startsWith("data: "));
       if (dataLine) {
-        messages.push(JSON.parse(dataLine.slice(6)));
+        const idLine = lines.find((line) => line.startsWith("id: "));
+        blocks.push({ id: idLine?.slice(4), msg: JSON.parse(dataLine.slice(6)) });
       }
     }
   }
 
   reader.releaseLock();
-  return messages;
+  return blocks;
+}
+
+async function readMessages(response: Response, count: number): Promise<TaskSSEMessage[]> {
+  return (await readBlocks(response, count)).map((b) => b.msg);
 }
 
 async function readRawChunks(response: Response, count: number): Promise<string> {
@@ -71,6 +79,29 @@ async function readRawChunks(response: Response, count: number): Promise<string>
   }
   reader.releaseLock();
   return result;
+}
+
+/** Race a read against a short timeout, so tests can assert that nothing arrives. */
+async function readOrTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  ms = 50,
+): Promise<string | "timeout" | "done"> {
+  const result = await Promise.race([
+    reader.read(),
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), ms)),
+  ]);
+  if (result === "timeout") return "timeout";
+  if (result.done) return "done";
+  return new TextDecoder().decode(result.value);
+}
+
+const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Connect, read the init dump and return the `<epoch>:<id>` of the last init message. */
+async function connectAndGetLastEventId(tm: TaskManager, initCount: number): Promise<string> {
+  const response = await tm.createSSEHandler()(makeEvent());
+  const blocks = await readBlocks(response, initCount);
+  return blocks[blocks.length - 1].id!;
 }
 
 describe("createSSEHandler", () => {
@@ -91,6 +122,7 @@ describe("createSSEHandler", () => {
     const response = await handler(makeEvent());
     expect(response.headers.get("Content-Type")).toBe("text/event-stream");
     expect(response.headers.get("Cache-Control")).toBe("no-cache");
+    expect(response.headers.get("X-Accel-Buffering")).toBe("no");
   });
 
   it("sends init messages for all registered tasks", async () => {
@@ -130,12 +162,43 @@ describe("createSSEHandler", () => {
     tm.start("test");
 
     // Wait for handler to run
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await tick(50);
 
     // Read update messages (running + progress + completed)
     const updates = await readMessages(response, 1);
     expect(updates.length).toBeGreaterThanOrEqual(1);
     expect(updates[0].type).toBe("update");
+  });
+
+  it("streams an update when a task is registered after connecting", async () => {
+    const tm = new TaskManager();
+    tm.register("a", async () => {});
+
+    const response = await tm.createSSEHandler()(makeEvent());
+    await readMessages(response, 1);
+
+    tm.register("b", async () => {});
+
+    const [msg] = await readMessages(response, 1);
+    expect(msg).toEqual({ type: "update", taskId: "b", state: { id: "b", status: "pending" } });
+  });
+
+  it("streams a removed message when an ephemeral task is evicted", async () => {
+    const tm = new TaskManager({ maxHistory: 1 });
+    tm.register("job-1", async () => {}, { ephemeral: true });
+    tm.register("job-2", async () => {}, { ephemeral: true });
+
+    const response = await tm.createSSEHandler()(makeEvent());
+    await readMessages(response, 2);
+
+    tm.start("job-1");
+    await tick();
+    tm.start("job-2");
+    await tick();
+
+    // job-1: running, completed; job-2: running, completed; then job-1 removed
+    const messages = await readMessages(response, 5);
+    expect(messages[4]).toEqual({ type: "removed", taskId: "job-1" });
   });
 
   it("sends data-only SSE messages without event field", async () => {
@@ -150,7 +213,7 @@ describe("createSSEHandler", () => {
     expect(raw).not.toContain("event:");
   });
 
-  it("includes id field in SSE messages", async () => {
+  it("tags SSE ids with a per-instance epoch", async () => {
     const tm = new TaskManager();
     tm.register("a", async () => {});
 
@@ -158,14 +221,14 @@ describe("createSSEHandler", () => {
     const response = await handler(makeEvent());
 
     const raw = await readRawChunks(response, 1);
-    expect(raw).toMatch(/id: \d+/);
+    expect(raw).toMatch(/id: [a-z0-9]+:\d+\n/);
   });
 
   it("supports async authorize", async () => {
     const tm = new TaskManager();
     const handler = tm.createSSEHandler({
       authorize: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await tick();
         return true;
       },
     });
@@ -174,66 +237,168 @@ describe("createSSEHandler", () => {
     expect(response.status).toBe(200);
   });
 
-  it("replays buffered events when client provides lastEventId", async () => {
-    const tm = new TaskManager({ eventBufferSize: 100 });
-    tm.register("test", async (ctx) => {
-      ctx.progress("Step 1", 1, 2);
-      ctx.progress("Step 2", 2, 2);
+  describe("Last-Event-ID replay", () => {
+    it("replays buffered events when client provides lastEventId", async () => {
+      const tm = new TaskManager({ eventBufferSize: 100 });
+      tm.register("test", async (ctx) => {
+        ctx.progress("Step 1", 1, 2);
+        ctx.progress("Step 2", 2, 2);
+      });
+
+      const handler = tm.createSSEHandler();
+      const lastEventId = await connectAndGetLastEventId(tm, 1);
+
+      // Start task to generate buffered events
+      tm.start("test");
+      await tick(50);
+
+      // Reconnect — should replay the buffered events, not an init dump
+      const response2 = await handler(makeEventWithParam({ lastEventId }));
+      const replayed = await readMessages(response2, 1);
+      expect(replayed[0].type).toBe("update");
     });
 
-    const handler = tm.createSSEHandler();
+    it("replays exactly the missed events, in order, after the ring buffer has wrapped", async () => {
+      const tm = new TaskManager({ eventBufferSize: 3 });
+      tm.register("test", async (ctx) => {
+        ctx.progress("p1");
+        ctx.progress("p2");
+      });
 
-    // First connection — get init
-    const response1 = await handler(makeEvent());
-    const inits = await readMessages(response1, 1);
-    expect(inits[0].type).toBe("init");
+      const handler = tm.createSSEHandler();
+      // register emitted event 1; the init dump is tagged with id 1
+      const lastEventId = await connectAndGetLastEventId(tm, 1);
 
-    // Start task to generate buffered events
-    tm.start("test");
-    await new Promise((resolve) => setTimeout(resolve, 50));
+      // Emits running (2), p1 (3), p2 (4), completed (5): buffer now holds 3, 4, 5 with ringHead > 0
+      tm.start("test");
+      await tick(50);
 
-    // Reconnect with lastEventId=0 — should replay all buffered events
-    const response2 = await handler(makeEventWithParam({ lastEventId: "0" }));
-    const replayed = await readMessages(response2, 1);
-    expect(replayed[0].type).toBe("update");
+      // Client saw up to 2 — the buffer's oldest is 3, so the gap check passes
+      const [epoch] = lastEventId.split(":");
+      const response = await handler(makeEventWithParam({ lastEventId: `${epoch}:2` }));
+      const blocks = await readBlocks(response, 3);
+
+      expect(blocks.map((b) => b.id)).toEqual([`${epoch}:3`, `${epoch}:4`, `${epoch}:5`]);
+      expect(blocks.map((b) => b.msg)).toEqual([
+        {
+          type: "update",
+          taskId: "test",
+          state: { id: "test", status: "running", progress: { message: "p1" } },
+        },
+        {
+          type: "update",
+          taskId: "test",
+          state: { id: "test", status: "running", progress: { message: "p2" } },
+        },
+        {
+          type: "update",
+          taskId: "test",
+          state: { id: "test", status: "completed", lastRun: expect.any(Number) },
+        },
+      ]);
+    });
+
+    it("falls back to init dump when buffer cannot satisfy lastEventId", async () => {
+      const tm = new TaskManager({ eventBufferSize: 1 });
+      tm.register("test", async (ctx) => {
+        ctx.progress("p1");
+        ctx.progress("p2");
+        ctx.progress("p3");
+      });
+
+      const handler = tm.createSSEHandler();
+      const lastEventId = await connectAndGetLastEventId(tm, 1);
+
+      // Generate events that overflow the tiny buffer
+      tm.start("test");
+      await tick(50);
+
+      // Reconnect with a lastEventId that has fallen out of the buffer
+      const response = await handler(makeEventWithParam({ lastEventId }));
+      const messages = await readMessages(response, 1);
+      expect(messages[0].type).toBe("init");
+    });
+
+    it("falls back to init dump when lastEventId comes from a previous server process", async () => {
+      // Simulate a restart: the client holds an id from an old manager instance
+      const oldTm = new TaskManager({ eventBufferSize: 100 });
+      oldTm.register("test", async () => {});
+      const staleId = await connectAndGetLastEventId(oldTm, 1);
+
+      const tm = new TaskManager({ eventBufferSize: 100 });
+      tm.register("test", async () => {});
+      tm.start("test");
+      await tick(50);
+
+      const response = await tm.createSSEHandler()(makeEventWithParam({ lastEventId: staleId }));
+      const messages = await readMessages(response, 1);
+      expect(messages[0]).toEqual({
+        type: "init",
+        task: { id: "test", status: "completed", lastRun: expect.any(Number) },
+      });
+    });
+
+    it("falls back to init dump for a legacy numeric or malformed lastEventId", async () => {
+      const tm = new TaskManager({ eventBufferSize: 100 });
+      tm.register("test", async () => {});
+      const [epoch] = (await connectAndGetLastEventId(tm, 1)).split(":");
+
+      for (const lastEventId of ["0", "500", "abc", `${epoch}:abc`, `${epoch}:999`]) {
+        const response = await tm.createSSEHandler()(makeEventWithParam({ lastEventId }));
+        const messages = await readMessages(response, 1);
+        expect(messages[0].type, `lastEventId=${lastEventId}`).toBe("init");
+      }
+    });
+
+    it("reads Last-Event-ID from request header (SSE spec)", async () => {
+      const tm = new TaskManager({ eventBufferSize: 100 });
+      tm.register("test", async (ctx) => {
+        ctx.progress("Step 1", 1, 2);
+      });
+
+      const handler = tm.createSSEHandler();
+      const lastEventId = await connectAndGetLastEventId(tm, 1);
+
+      // Generate buffered events
+      tm.start("test");
+      await tick(50);
+
+      // Reconnect with Last-Event-ID header
+      const response = await handler(makeEventWithHeader({ "Last-Event-ID": lastEventId }));
+      const replayed = await readMessages(response, 1);
+      expect(replayed[0].type).toBe("update");
+    });
   });
 
-  it("falls back to init dump when buffer cannot satisfy lastEventId", async () => {
-    const tm = new TaskManager({ eventBufferSize: 1 });
-    tm.register("test", async (ctx) => {
-      ctx.progress("p1");
-      ctx.progress("p2");
-      ctx.progress("p3");
+  describe("lifecycle", () => {
+    const subscriberCount = (tm: TaskManager) =>
+      (tm as unknown as { subscribers: Set<unknown> }).subscribers.size;
+
+    it("unsubscribes from the manager when the client disconnects", async () => {
+      const tm = new TaskManager();
+      tm.register("a", async () => {});
+
+      const response = await tm.createSSEHandler()(makeEvent());
+      await readMessages(response, 1);
+      expect(subscriberCount(tm)).toBe(1);
+
+      await response.body!.cancel();
+      expect(subscriberCount(tm)).toBe(0);
     });
 
-    const handler = tm.createSSEHandler();
+    it("closes open streams on dispose", async () => {
+      const tm = new TaskManager();
+      tm.register("a", async () => {});
 
-    // Generate events that overflow the tiny buffer
-    tm.start("test");
-    await new Promise((resolve) => setTimeout(resolve, 50));
+      const response = await tm.createSSEHandler()(makeEvent());
+      const reader = response.body!.getReader();
+      await reader.read(); // init
 
-    // Reconnect with very old lastEventId — buffer can't serve
-    const response = await handler(makeEventWithParam({ lastEventId: "0" }));
-    const messages = await readMessages(response, 1);
-    expect(messages[0].type).toBe("init");
-  });
+      tm[Symbol.dispose]();
 
-  it("reads Last-Event-ID from request header (SSE spec)", async () => {
-    const tm = new TaskManager({ eventBufferSize: 100 });
-    tm.register("test", async (ctx) => {
-      ctx.progress("Step 1", 1, 2);
+      expect(await readOrTimeout(reader)).toBe("done");
+      expect(subscriberCount(tm)).toBe(0);
     });
-
-    const handler = tm.createSSEHandler();
-
-    // Generate buffered events
-    tm.start("test");
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    // Reconnect with Last-Event-ID header
-    const response = await handler(makeEventWithHeader({ "Last-Event-ID": "0" }));
-    const replayed = await readMessages(response, 1);
-    expect(replayed[0].type).toBe("update");
   });
 
   it("does not include Connection header in response", async () => {

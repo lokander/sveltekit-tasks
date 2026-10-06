@@ -72,8 +72,11 @@ export type TaskContext = {
  * Discriminated union of SSE message types sent from server to client.
  *
  * - `"init"` — sent once per task when a client connects, carrying the full current state.
- * - `"update"` — sent whenever a task's state changes after the initial snapshot.
+ * - `"update"` — sent whenever a task's state changes after the initial snapshot,
+ *   including when a new task is registered (its `"pending"` state).
+ * - `"removed"` — sent when a task is unregistered (e.g. evicted by `maxHistory`).
  */
 export type TaskSSEMessage =
   | { type: "init"; task: TaskState }
-  | { type: "update"; taskId: string; state: TaskState };
+  | { type: "update"; taskId: string; state: TaskState }
+  | { type: "removed"; taskId: string };

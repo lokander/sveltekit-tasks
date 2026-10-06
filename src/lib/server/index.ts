@@ -4,6 +4,8 @@ export type {
   TaskHandler,
   TaskRegisterOptions,
   TaskUpdateEvent,
+  TaskRemovedEvent,
+  TaskEvent,
   TaskManagerOptions,
   TaskSSEHandlerOptions,
 } from "./manager.js";
