@@ -58,7 +58,13 @@ export type TaskEvent = TaskUpdateEvent | TaskRemovedEvent;
 
 /** Options for {@link TaskManager.createSSEHandler}. */
 export type TaskSSEHandlerOptions = {
-  /** Optional authorization check. Return `false` (or a `Promise<false>`) to respond with 403. */
+  /**
+   * Optional authorization check. Return `false` (or a `Promise<false>`) to respond with 403.
+   *
+   * `EventSource` doesn't expose the response status, so a client that is refused can't tell
+   * a 403 from a server outage: `TaskEventSource` reports `"reconnecting"` until it runs out of
+   * retries. Don't render the SSE-backed UI for users who aren't allowed to see it.
+   */
   authorize?: (event: RequestEvent) => boolean | Promise<boolean>;
   /** Interval in ms between SSE heartbeat comments. Keeps the connection alive through proxies. @default 30_000 */
   heartbeatInterval?: number;
