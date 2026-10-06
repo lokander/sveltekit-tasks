@@ -25,7 +25,9 @@ bun add sveltekit-tasks
 deno add npm:sveltekit-tasks
 ```
 
-Peer dependencies: `svelte ^5.0.0`, `@sveltejs/kit ^2.0.0`
+Peer dependencies: `svelte ^5.0.0`, `@sveltejs/kit ^2.0.0 || ^3.0.0`
+
+> On SvelteKit 3, replace the `$lib/...` imports in the examples below with `#lib/...`.
 
 ## Quick Start
 
