@@ -201,6 +201,28 @@ describe("createSSEHandler", () => {
     expect(messages[4]).toEqual({ type: "removed", taskId: "job-1" });
   });
 
+  // Node's `http` server only sends response headers with the first body chunk, and
+  // EventSource doesn't fire `open` until it sees them.
+  it("sends a comment immediately when there is nothing to dump", async () => {
+    const tm = new TaskManager();
+
+    const response = await tm.createSSEHandler()(makeEvent());
+    const reader = response.body!.getReader();
+
+    expect(await readOrTimeout(reader)).toMatch(/^: /);
+  });
+
+  it("sends a comment immediately when a replay has no missed events", async () => {
+    const tm = new TaskManager({ eventBufferSize: 10 });
+    tm.register("a", async () => {});
+    const lastEventId = await connectAndGetLastEventId(tm, 1);
+
+    const response = await tm.createSSEHandler()(makeEventWithParam({ lastEventId }));
+    const reader = response.body!.getReader();
+
+    expect(await readOrTimeout(reader)).toMatch(/^: /);
+  });
+
   it("sends data-only SSE messages without event field", async () => {
     const tm = new TaskManager();
     tm.register("a", async () => {});
@@ -208,7 +230,7 @@ describe("createSSEHandler", () => {
     const handler = tm.createSSEHandler();
     const response = await handler(makeEvent());
 
-    const raw = await readRawChunks(response, 1);
+    const raw = await readRawChunks(response, 2);
     expect(raw).toContain("data: ");
     expect(raw).not.toContain("event:");
   });
@@ -220,7 +242,7 @@ describe("createSSEHandler", () => {
     const handler = tm.createSSEHandler();
     const response = await handler(makeEvent());
 
-    const raw = await readRawChunks(response, 1);
+    const raw = await readRawChunks(response, 2);
     expect(raw).toMatch(/id: [a-z0-9]+:\d+\n/);
   });
 
@@ -392,6 +414,7 @@ describe("createSSEHandler", () => {
 
       const response = await tm.createSSEHandler()(makeEvent());
       const reader = response.body!.getReader();
+      await reader.read(); // connected comment
       await reader.read(); // init
 
       tm[Symbol.dispose]();

@@ -301,7 +301,8 @@ export class TaskManager {
   /**
    * Create a SvelteKit `GET` request handler that streams task state via Server-Sent Events.
    *
-   * On connection the handler sends an `"init"` message for every registered task,
+   * On connection the handler sends a `: connected` comment (so response headers are
+   * flushed immediately), then an `"init"` message for every registered task,
    * then streams `"update"` and `"removed"` messages as tasks change. A heartbeat
    * comment (`: heartbeat`) is sent periodically to keep the connection alive.
    *
@@ -347,6 +348,12 @@ export class TaskManager {
 
       const stream = new ReadableStream({
         start: (controller) => {
+          // Node's `http` server (adapter-node, Vite dev/preview, and Bun running either) only
+          // sends response headers with the first body chunk, and EventSource doesn't fire
+          // `open` until it sees them. Without this, a connection with nothing to dump or
+          // replay would stay "connecting" until the first heartbeat.
+          controller.enqueue(encoder.encode(`: connected\n\n`));
+
           let replayed = false;
 
           // Attempt replay from buffer if client provided a lastEventId
