@@ -10,7 +10,7 @@ Background task runner for SvelteKit with real-time progress streaming via Serve
 - Real-time progress streaming to the client via SSE
 - Task cancellation with AbortController/AbortSignal
 - Per-task timeout with automatic cancellation (`timed_out` status)
-- Reactive Svelte 5 client (`TaskEventSource`) with auto-reconnect and event replay
+- Reactive Svelte 5 client (`TaskEventSource`) with auto-reconnect, event replay and manual `close()`/`reconnect()`
 - Composable `TaskItem` component with snippet-based per-status rendering
 - Authorization support for SSE endpoints
 - Configurable task history retention (`maxHistory`)
@@ -103,12 +103,15 @@ const tasks = new TaskManager({
 
 tasks.register(id, handler); // Register a task
 tasks.register(id, handler, { timeout: 60_000 }); // Register with 60s timeout
+tasks.register(id, handler, { ephemeral: true }); // Per-job task, removed on maxHistory eviction
 tasks.start(taskId); // Start a task (fire-and-forget)
 tasks.cancel(taskId); // Cancel a running task
 tasks.getState(taskId); // Get single task state
 tasks.getAllStates(); // Get all task states
-tasks.subscribe(callback); // Subscribe to updates (returns unsubscribe fn)
+tasks.subscribe(callback); // Subscribe to events (returns unsubscribe fn)
 ```
+
+`subscribe` receives a `TaskEvent` — `{ type: "update", taskId, state, eventId }` for every registration, status transition and progress report, or `{ type: "removed", taskId, eventId }` when a task is unregistered. Narrow on `event.type` before reading `event.state`.
 
 The `handler` receives a `TaskContext`:
 
@@ -122,11 +125,15 @@ The `handler` receives a `TaskContext`:
 
 #### `maxHistory`
 
-Limits the number of tasks in terminal states (completed, error, canceled, timed_out) kept in memory. When exceeded, the oldest terminal tasks (by `lastRun`) are evicted from all internal maps. Useful for long-running servers with dynamically registered tasks.
+Limits how many tasks in terminal states (completed, error, canceled, timed_out) keep their result. When exceeded, the oldest terminal tasks (by `lastRun`) are evicted:
+
+- Regular registered tasks are **reset to `"pending"`** — the handler stays registered and the task can be started again.
+- Tasks registered with `{ ephemeral: true }` are **unregistered entirely** (handler included) and clients receive a `"removed"` message. Use this for dynamically created per-job tasks (`import-${jobId}`) so they don't accumulate on a long-running server.
+- Persisted states for ids that were never registered in this process are deleted from storage.
 
 #### `persistence`
 
-State is in-memory by default. Pass a `PersistenceAdapter` to restore task state after a server restart. The built-in `sqliteAdapter` has no dependencies and works with any synchronous SQLite driver — `node:sqlite`, `better-sqlite3` or `bun:sqlite`:
+State is in-memory by default. Pass a `PersistenceAdapter` to restore task state after a server restart. The built-in `sqliteAdapter` has no dependencies and works with any synchronous SQLite driver — `node:sqlite` (Node 22.5+), `better-sqlite3` or `bun:sqlite`:
 
 ```ts
 import { DatabaseSync } from "node:sqlite"; // or: import Database from "better-sqlite3";
@@ -165,6 +172,8 @@ With an async `load()`, persisted state is applied when it resolves — `await t
 
 Enables event buffering for `Last-Event-ID` replay. When a client reconnects, it sends its last received event ID. If the buffer can satisfy the request, only missed events are replayed instead of a full state dump. Set to `0` (default) to disable.
 
+Event IDs are tagged with a random per-process epoch (`<epoch>:<n>`), so a client reconnecting after a server restart always gets a fresh full state dump rather than a replay from the wrong process.
+
 ### `tasks.createSSEHandler(options?)`
 
 ```ts
@@ -173,6 +182,8 @@ export const GET = tasks.createSSEHandler({
   heartbeatInterval: 30_000, // keepalive interval (ms)
 });
 ```
+
+> **Security:** the SSE stream carries each task's full state, including the `error` message of failed runs, verbatim. If handler errors may contain sensitive details (connection strings, file paths), add an `authorize` check or sanitize errors before throwing.
 
 ### `TaskEventSource` (client)
 
@@ -188,9 +199,24 @@ const taskEvents = new TaskEventSource("/sse-url", {
 ```
 
 - `taskEvents.tasks` — reactive `SvelteMap<string, TaskState>`, updated in real-time from SSE messages
-- `taskEvents.connected` — reactive `boolean`, `true` while the SSE connection is open
+- `taskEvents.status` — reactive `TaskEventSourceStatus`: `"connecting"` (first attempt), `"open"`, `"reconnecting"` (dropped, retry pending), `"exhausted"` (`maxRetries` consecutive failures) or `"closed"`
+- `taskEvents.connected` / `.exhausted` / `.closed` — reactive `boolean` shorthands for `status === "open"` / `"exhausted"` / `"closed"`
+- `taskEvents.close()` — close the connection and stop reconnecting (the task map is kept)
+- `taskEvents.reconnect()` — (re)open the connection immediately and reset the retry counter
 
-Reconnects with exponential backoff on disconnect, sending the last event ID for replay when available.
+Reconnects with exponential backoff on disconnect, sending the last event ID for replay when available. The connection is closed automatically when the owning component is destroyed.
+
+Use `status` rather than `!connected` for connection UI — on a fresh page load the connection is `"connecting"` until the first `open`, which is not an error state:
+
+```svelte
+{#if taskEvents.status === "connecting"}
+  <p>Connecting…</p>
+{:else if taskEvents.status === "reconnecting"}
+  <p>Connection lost, reconnecting…</p>
+{:else if taskEvents.status === "exhausted"}
+  <button onclick={() => taskEvents.reconnect()}>Reconnect</button>
+{/if}
+```
 
 ### `TaskItem` (client)
 
@@ -226,6 +252,11 @@ import type {
   TaskState, // discriminated union (see below)
   TaskContext, // { progress(), isCanceled(), signal }
 } from "sveltekit-tasks";
+
+import type {
+  TaskEvent, // TaskUpdateEvent | TaskRemovedEvent — what subscribe() receives
+  PersistenceAdapter,
+} from "sveltekit-tasks/server";
 ```
 
 | Status        | Fields                   |
