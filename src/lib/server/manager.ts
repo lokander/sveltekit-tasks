@@ -417,7 +417,8 @@ export class TaskManager {
       return new Response(stream, {
         headers: {
           "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
+          // `no-transform` stops compression middleware and proxies from buffering the stream
+          "Cache-Control": "no-cache, no-transform",
           // Disable response buffering in nginx so events reach the client immediately
           "X-Accel-Buffering": "no",
         },
